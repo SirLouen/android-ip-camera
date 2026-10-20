@@ -74,8 +74,12 @@ internal class RtspServer(
         // Same limits as the HTTP server's streaming clients.
         private const val MAX_SESSIONS = 3
         private const val MAX_AUTHENTICATED_SESSIONS = 10
-        /** How long DESCRIBE waits for the encoder's SPS/PPS when the camera was idle. */
-        private const val PARAMETER_SET_WAIT_MS = 8_000L
+        /**
+         * How long DESCRIBE waits for the encoder's SPS/PPS when the camera was idle. VLC gives
+         * OPTIONS + DESCRIBE 5 s in total (its ipv4-timeout) and reports a connection failure after
+         * that, so answer well within it; players take SPS/PPS from the keyframes instead.
+         */
+        private const val PARAMETER_SET_WAIT_MS = 2_500L
         private const val PARAMETER_SET_FRESH_NS = 3_000_000_000L
         private const val NONCE_TTL_MS = 5 * 60 * 1000L
         /** Disconnect a client whose socket write has not completed within this window. */
