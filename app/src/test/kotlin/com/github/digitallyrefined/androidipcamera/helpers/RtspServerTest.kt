@@ -76,6 +76,21 @@ class RtspServerTest {
     }
 
     @Test
+    fun `describe does not keep players waiting for a camera that is still starting`() {
+        // No frames at all: the camera is still starting. VLC fails OPTIONS + DESCRIBE after 5 s.
+        client().use { c ->
+            val started = System.nanoTime()
+            c.request("OPTIONS", "*")
+            val describe = c.authenticated("DESCRIBE", c.url)
+            val elapsedMs = (System.nanoTime() - started) / 1_000_000
+            assertEquals(200, describe.status)
+            assertTrue("OPTIONS + DESCRIBE took $elapsedMs ms", elapsedMs < 4_000)
+            assertFalse(String(describe.body).contains("sprop-parameter-sets"))
+            assertTrue(server.hasVideoClients())
+        }
+    }
+
+    @Test
     fun `plays video and audio interleaved over tcp starting at a keyframe`() {
         server.onVideoFrame(keyFrame, true, nowUs())
         client().use { c ->
