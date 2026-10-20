@@ -542,6 +542,23 @@ class StreamingService : LifecycleService() {
         id?.let { cm.getCameraCharacteristics(it).get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL) }
     } catch (_: Exception) { null }
 
+    /** SENSOR_ORIENTATION of the selected camera, or null if it cannot be read. */
+    private fun sensorOrientation(): Int? = try {
+        val cm = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        val id = selectedCameraId
+            ?.let { parseCameraToken(it).logicalId }
+            ?.takeIf { it in cm.cameraIdList }
+            ?: firstCameraIdForFacing(frontFacing)
+        id?.let { cm.getCameraCharacteristics(it).get(CameraCharacteristics.SENSOR_ORIENTATION) }
+    } catch (_: Exception) { null }
+
+    /** Encoder frame for the CameraX surface path: [want] turned to the picture's orientation. */
+    private fun surfaceEncoderSize(want: Size): Size {
+        val sensor = sensorOrientation() ?: return want
+        val (w, h) = CameraGlPipe.frameSize(want.width, want.height, sensor, quantizedRotation(readRotatePref()))
+        return Size(w, h)
+    }
+
     private fun supportsSurfaceEncoder(): Boolean {
         if (frontFacing) return false
         val level = cameraHardwareLevel(selectedCameraId) ?: return false
@@ -732,20 +749,31 @@ class StreamingService : LifecycleService() {
             val prefs = PreferenceManager.getDefaultSharedPreferences(this)
             val fps = prefs.getString("stream_fps", "30")?.toIntOrNull() ?: 30
             val fpsCoerced = fps.coerceIn(1, 60)
-            val enc = H264HardwareEncoder(
-                want.width,
-                want.height,
+            fun newEncoder(size: Size) = H264HardwareEncoder(
+                size.width,
+                size.height,
                 fpsCoerced,
-                H264HardwareEncoder.bitrateFor(want.width, want.height),
+                H264HardwareEncoder.bitrateFor(size.width, size.height),
                 true // useSurface = true
             ) { d, k, pts -> h264.broadcastH264(d, k, pts) }
+
+            // Encode in the picture's shape (portrait when the camera image is upright portrait).
+            // Some older encoders reject portrait sizes; they keep the landscape frame instead.
+            val frame = surfaceEncoderSize(want)
+            val enc = try {
+                newEncoder(frame)
+            } catch (e: Exception) {
+                if (frame == want) throw e
+                Log.w(TAG, "H.264 encoder rejected ${frame.width}x${frame.height}, using ${want.width}x${want.height}: ${e.message}")
+                newEncoder(want)
+            }
 
             h264.setEncoder(enc)
             streamingServerHelper?.resetH264Wait()
 
             // Route CameraX frames through a GL pipe so mirror can be applied
             // without restarting the camera (the pipe reads mirror on each frame).
-            val pipe = CameraGlPipe(enc.inputSurface!!, want.width, want.height, fpsCoerced, standardBuffer = true).also {
+            val pipe = CameraGlPipe(enc.inputSurface!!, enc.width, enc.height, fpsCoerced, standardBuffer = true).also {
                 it.mirror = readMirrorPref()
                 it.rotation = quantizedRotation(readRotatePref())
                 it.start()
@@ -755,7 +783,10 @@ class StreamingService : LifecycleService() {
             h264SurfaceProvider = Preview.SurfaceProvider { request ->
                 val surface = pipe.inputSurface
                 if (surface != null && surface.isValid) {
-                    Log.i(TAG, "Providing CameraX H.264 surface via GL pipe (mirror=${pipe.mirror})")
+                    // Render at the resolution CameraX negotiated rather than the pipe's
+                    // placeholder buffer size, so the selected resolution is what gets captured.
+                    pipe.setCameraBufferSize(request.resolution.width, request.resolution.height)
+                    Log.i(TAG, "Providing CameraX H.264 surface via GL pipe (${request.resolution}, mirror=${pipe.mirror})")
                     enc.hasSurfaceBeenProvided = true
                     request.provideSurface(surface, ContextCompat.getMainExecutor(this)) { result ->
                         Log.i(TAG, "CameraX H.264 surface released by CameraX (result code: ${result.resultCode})")
@@ -1339,6 +1370,14 @@ class StreamingService : LifecycleService() {
                 val q = quantizedRotation(norm)
                 glPipe?.rotation = q
                 cameraXGlPipe?.rotation = q
+                // The CameraX surface encoder's frame follows the picture's shape, so a quarter
+                // turn needs a new encoder (the byte-buffer encoder resizes itself per frame).
+                // Not while recording: restarting the camera would end the recording.
+                val current = h264StreamingEncoder?.h264HardwareEncoder
+                if (cameraXGlPipe != null && current != null && localRecorder?.isRecording != true) {
+                    val target = surfaceEncoderSize(desiredSize())
+                    if (target.width != current.width || target.height != current.height) debouncedStartCamera()
+                }
             }
             "scale" -> {
                 // Persist scale per-camera (string like "1.0")
