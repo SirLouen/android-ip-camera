@@ -267,6 +267,18 @@ The app uses the following permissions to function:
 Some of the code in this repository may be generated with the assistance of AI tools. All changes are reviewed and tested on a real device with a human in the loop before being released.
 
 <details>
+<summary>Releases of this fork</summary>
+
+This fork is versioned independently of [upstream](https://github.com/DigitallyRefined/android-ip-camera), starting at `0.1.0`. To publish a release:
+
+1. In `app/build.gradle`, set `versionName` to the new version and increase `versionCode` by one.
+2. Merge that change, then push a matching tag, e.g. `git tag v0.1.0 && git push origin v0.1.0` (or run the **Release** workflow from the Actions tab with the tag as input).
+
+The [Release workflow](.github/workflows/release.yml) builds and signs the APKs and attaches them to a GitHub release. It needs the `SIGNING_KEYSTORE_BASE64`, `SIGNING_STORE_PASSWORD`, `SIGNING_KEY_ALIAS` and `SIGNING_KEY_PASSWORD` repository secrets.
+
+</details>
+
+<details>
 <summary>Reproducible builds</summary>
 
 This project uses [reproducible builds](https://f-droid.org/docs/Reproducible_Builds/). Release APKs should be built from a clean tree at the tagged commit using Gradle directly:
