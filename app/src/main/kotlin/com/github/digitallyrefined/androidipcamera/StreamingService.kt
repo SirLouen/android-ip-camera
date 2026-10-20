@@ -82,6 +82,8 @@ class StreamingService : LifecycleService() {
      *  session-bound torch, a setTorchMode torch survives process death. */
     @Volatile private var deviceTorchOn = false
     @Volatile private var localRecorder: LocalRecorder? = null
+    /** Smaller encoder feeding the RTSP sub stream (/live/sub) while it has viewers. */
+    @Volatile private var subEncoder: H264HardwareEncoder? = null
 
     @Volatile private var frontFacing = false             // false = back camera (read across threads)
     @Volatile private var selectedCameraId: String? = null
@@ -352,7 +354,11 @@ class StreamingService : LifecycleService() {
                     onLog = { Log.i(TAG, "RTSP: $it"); onLog?.invoke(it) },
                     clientConnected = { handleClientConnected() },
                     clientDisconnected = { handleClientDisconnected() },
-                    keyFrameRequest = { h264StreamingEncoder?.h264HardwareEncoder?.requestKeyFrame() },
+                    keyFrameRequest = { stream ->
+                        val sub = subEncoder
+                        if (stream == RtspStream.SUB && sub != null) sub.requestKeyFrame()
+                        else h264StreamingEncoder?.h264HardwareEncoder?.requestKeyFrame()
+                    },
                     streamingEnabled = { streamingServerHelper?.isStreamingEnabled() != false }
                 ),
                 DeviceMemoryHelper.rtspSendQueueCapacity(this)
@@ -375,8 +381,11 @@ class StreamingService : LifecycleService() {
             onClientConnected?.invoke()
             // While recording, the camera is already running and feeding the encoder; a
             // restart would finalize the recording, and new viewers pick up the existing
-            // stream, so no reconfiguration is needed.
-            if (localRecorder?.isRecording == true) return@launchMain
+            // stream, so no reconfiguration is needed (the sub stream encoder needs no restart).
+            if (localRecorder?.isRecording == true) {
+                updateSubStream()
+                return@launchMain
+            }
             if (captureRunning) {
                 debouncedStartCamera()
             } else {
@@ -390,7 +399,10 @@ class StreamingService : LifecycleService() {
             onClientDisconnected?.invoke()
             // Recording owns the camera: stopping or restarting it now would finalize
             // the file, and remaining viewers keep their existing stream as-is.
-            if (localRecorder?.isRecording == true) return@launchMain
+            if (localRecorder?.isRecording == true) {
+                updateSubStream()
+                return@launchMain
+            }
             if (!hasActiveClients()) {
                 // Reload/idle: keep the LED lit across the session gap before the
                 // shed-restart tears the streaming camera down.
@@ -684,6 +696,7 @@ class StreamingService : LifecycleService() {
 
             captureRunning = true
             encoders.forEach { it.start() }
+            updateSubStream()
             // Still no viewers? The camera is open purely to keep the torch lit.
             if (resumeTorchHold && !hasActiveClients() && currentSurfaceProvider == null) {
                 cameraHeldForTorch = true
@@ -845,10 +858,63 @@ class StreamingService : LifecycleService() {
         if (closeDuration > 1000) {
             Log.w(TAG, "Camera close took ${closeDuration}ms — HAL is slow to release resources")
         }
+        stopSubStream()   // detach it from the GL pipe while the pipe is still running
         cameraXGlPipe?.stop(); cameraXGlPipe = null
         glPipe?.stop(); glPipe = null
         encoders.forEach { it.stop() }
         captureRunning = false
+    }
+
+    // ---------------- RTSP sub stream ----------------
+
+    /**
+     * Runs the RTSP sub stream's own small encoder while a /live/sub viewer is connected and the
+     * H.264 picture goes through a GL pipe, which then draws every frame into it too. Without a
+     * pipe (byte-buffer capture: front camera, LIMITED devices) the sub stream carries the main
+     * encoder's frames instead.
+     */
+    private fun updateSubStream() {
+        val rtsp = rtspServer ?: return
+        val h264 = h264StreamingEncoder ?: return
+        val pipe = cameraXGlPipe ?: glPipe
+        if (pipe == null || !rtsp.hasSubVideoClients()) {
+            stopSubStream()
+            return
+        }
+        if (subEncoder != null) return
+        val prefs = PreferenceManager.getDefaultSharedPreferences(this)
+        val shortSide = prefs.getString(RtspServer.PREF_SUB_SIZE, null)?.toIntOrNull() ?: RtspServer.DEFAULT_SUB_SIZE
+        val fps = (prefs.getString(RtspServer.PREF_SUB_FPS, null)?.toIntOrNull() ?: RtspServer.DEFAULT_SUB_FPS).coerceIn(1, 60)
+        val (w, h) = CameraGlPipe.scaledFrame(pipe.width, pipe.height, shortSide)
+        val enc = try {
+            H264HardwareEncoder(w, h, fps, H264HardwareEncoder.bitrateFor(w, h), true) { d, k, pts ->
+                rtsp.onVideoFrame(d, k, pts, RtspStream.SUB)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "RTSP sub stream encoder ${w}x$h failed, sub stream carries the main stream: ${e.message}")
+            return
+        }
+        subEncoder = enc
+        // Switch the sub stream's source: viewers wait for the new encoder's first keyframe.
+        h264.subStreamEncoded = true
+        rtsp.resyncVideo(RtspStream.SUB)
+        if (!pipe.setSecondaryOutput(enc.inputSurface, w, h, fps)) {
+            Log.w(TAG, "RTSP sub stream could not be attached to the GL pipe, sub stream carries the main stream")
+            stopSubStream()
+            return
+        }
+        enc.requestKeyFrame()
+        Log.i(TAG, "RTSP sub stream ${w}x$h @${fps}fps")
+    }
+
+    private fun stopSubStream() {
+        val enc = subEncoder ?: return
+        subEncoder = null
+        h264StreamingEncoder?.subStreamEncoded = false
+        rtspServer?.resyncVideo(RtspStream.SUB)
+        h264StreamingEncoder?.h264HardwareEncoder?.requestKeyFrame()
+        (cameraXGlPipe ?: glPipe)?.setSecondaryOutput(null)
+        enc.stop()
     }
 
     private fun readMirrorPref(): Boolean {

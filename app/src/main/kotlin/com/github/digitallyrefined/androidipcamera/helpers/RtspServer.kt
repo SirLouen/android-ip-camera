@@ -27,9 +27,25 @@ internal interface RtspAudioSource {
     fun stop()
 }
 
+/** The video streams on offer: [MAIN] at the selected resolution, [SUB] a smaller one for slow links. */
+internal enum class RtspStream {
+    MAIN, SUB;
+
+    companion object {
+        private val TRACK_SUFFIX = Regex("/trackID=\\d+$")
+
+        /** Stream a request URL addresses: a path ending in `/sub` (before any track suffix) is [SUB]. */
+        fun of(uri: String): RtspStream {
+            val path = TRACK_SUFFIX.replace(uri.substringBefore('?').trimEnd('/'), "").trimEnd('/')
+            return if (path.endsWith("/sub")) SUB else MAIN
+        }
+    }
+}
+
 /**
  * RTSP server (RFC 2326) publishing the camera at `rtsp://<ip>:<port>/live`: H.264 from the shared
- * hardware encoder and, optionally, AAC audio from the microphone.
+ * hardware encoder and, optionally, AAC audio from the microphone. `/live/sub` serves a smaller
+ * sub stream ([RtspStream.SUB]) for slow links; both share the audio track.
  *
  * RTP goes over UDP or interleaved in the RTSP TCP connection, so VLC, ffmpeg, go2rtc/Frigate and
  * NVRs can all play it. Requests use HTTP Digest authentication (Basic is accepted when a client
@@ -53,7 +69,7 @@ internal class RtspServer(
         /** A client needs video: the camera and H.264 encoder must run. */
         fun onClientConnected()
         fun onClientDisconnected()
-        fun requestKeyFrame()
+        fun requestKeyFrame(stream: RtspStream)
         fun log(message: String)
         /** Second clock camera timestamps may be on (elapsedRealtimeNanos on Android). */
         fun bootClockNanos(): Long? = null
@@ -62,9 +78,15 @@ internal class RtspServer(
     companion object {
         const val DEFAULT_PORT = 8554
         const val PATH = "/live"
+        const val SUB_PATH = "/live/sub"
         const val PREF_ENABLED = "rtsp_enabled"
         const val PREF_PORT = "rtsp_port"
         const val PREF_AUDIO = "rtsp_audio"
+        /** Sub stream: height of the short side in pixels, and frame rate. */
+        const val PREF_SUB_SIZE = "rtsp_sub_size"
+        const val PREF_SUB_FPS = "rtsp_sub_fps"
+        const val DEFAULT_SUB_SIZE = 360
+        const val DEFAULT_SUB_FPS = 15
 
         private const val SERVER_NAME = "Android IP Camera"
         private const val CNAME = "android-ip-camera"
@@ -113,11 +135,16 @@ internal class RtspServer(
     private val nonces = RtspNonces()
     private val random = SecureRandom()
     private val epochNs = System.nanoTime()
-    private val videoClock = RtpMediaClock(bootClockNanos = host::bootClockNanos)
     private val audioClock = RtpMediaClock(bootClockNanos = host::bootClockNanos)
-    @Volatile private var parameterSets: Pair<ByteArray, ByteArray>? = null
-    @Volatile private var lastVideoFrameNs: Long? = null
     private val audioLock = Any()
+
+    /** Per-stream video state: each stream has its own encoder, parameter sets and timestamps. */
+    private inner class VideoSource {
+        val clock = RtpMediaClock(bootClockNanos = host::bootClockNanos)
+        @Volatile var parameterSets: Pair<ByteArray, ByteArray>? = null
+        @Volatile var lastFrameNs: Long? = null
+    }
+    private val videoSources = RtspStream.values().associateWith { VideoSource() }
     private var audioSource: RtspAudioSource? = null
 
     /** Starts listening (no-op if already running). Binding happens on the accept thread. */
@@ -152,18 +179,35 @@ internal class RtspServer(
         connections.toList().forEach { it.close() }
     }
 
-    /** True while an RTSP client needs the H.264 encoder running. */
+    /** True while an RTSP client (of either stream) needs the camera and H.264 encoder running. */
     fun hasVideoClients(): Boolean = connections.any { it.demandsVideo }
 
-    /** Called from the encoder's output thread for every access unit (Annex-B, SPS/PPS on keyframes). */
-    fun onVideoFrame(accessUnit: ByteArray, isKey: Boolean, ptsUs: Long) {
+    /** True while a client needs the [RtspStream.SUB] stream. */
+    fun hasSubVideoClients(): Boolean = connections.any { it.demandsVideo && it.stream == RtspStream.SUB }
+
+    /**
+     * Called from an encoder's output thread for every access unit of [stream] (Annex-B, SPS/PPS
+     * on keyframes).
+     */
+    fun onVideoFrame(accessUnit: ByteArray, isKey: Boolean, ptsUs: Long, stream: RtspStream = RtspStream.MAIN) {
         if (!running) return
-        lastVideoFrameNs = System.nanoTime()
-        if (isKey) cacheParameterSets(accessUnit)
-        val sessions = connections.mapNotNull { c -> c.session?.takeIf { it.playing && it.video != null } }
+        val source = videoSources.getValue(stream)
+        source.lastFrameNs = System.nanoTime()
+        if (isKey) cacheParameterSets(source, accessUnit)
+        val sessions = connections.mapNotNull { c ->
+            c.session?.takeIf { it.stream == stream && it.playing && it.video != null }
+        }
         if (sessions.isEmpty()) return
-        val frame = MediaFrame(RtspSdp.VIDEO_TRACK, accessUnit, isKey, videoClock.toClockNs(ptsUs))
+        val frame = MediaFrame(RtspSdp.VIDEO_TRACK, accessUnit, isKey, source.clock.toClockNs(ptsUs))
         sessions.forEach { it.offer(frame) }
+    }
+
+    /**
+     * [stream] is about to come from a different encoder (e.g. the sub stream switching from the
+     * main encoder's frames to its own): hold its viewers until the new encoder's first keyframe.
+     */
+    fun resyncVideo(stream: RtspStream) {
+        connections.forEach { c -> c.session?.takeIf { it.stream == stream }?.waitForKeyFrame() }
     }
 
     private fun onAudioFrame(accessUnit: ByteArray, ptsUs: Long) {
@@ -173,14 +217,14 @@ internal class RtspServer(
         sessions.forEach { it.offer(frame) }
     }
 
-    private fun cacheParameterSets(accessUnit: ByteArray) {
+    private fun cacheParameterSets(source: VideoSource, accessUnit: ByteArray) {
         var sps: ByteArray? = null
         var pps: ByteArray? = null
         for (range in H264Bitstream.nalRanges(accessUnit)) {
             if (range.type == 7 && sps == null) sps = accessUnit.copyOfRange(range.start, range.end)
             if (range.type == 8 && pps == null) pps = accessUnit.copyOfRange(range.start, range.end)
         }
-        if (sps != null && pps != null) parameterSets = sps to pps
+        if (sps != null && pps != null) source.parameterSets = sps to pps
     }
 
     private fun isCurrent(gen: Int): Boolean = synchronized(lock) { running && gen == generation }
@@ -311,6 +355,9 @@ internal class RtspServer(
             private set
         /** Set from DESCRIBE/SETUP of video until the session ends: keeps the camera and encoder up. */
         @Volatile var demandsVideo = false
+            private set
+        /** Stream this connection described or set up (by URL path). */
+        @Volatile var stream = RtspStream.MAIN
             private set
         @Volatile var writeStartedNs = NOT_WRITING
             private set
@@ -470,8 +517,9 @@ internal class RtspServer(
         private fun describe(request: RtspRequest): Boolean {
             val cseq = request.cseq
             if (!host.isStreamingEnabled()) return respondStreamingDisabled(cseq)
+            if (session == null) stream = RtspStream.of(request.uri)
             claimVideo()
-            val params = awaitParameterSets()
+            val params = awaitParameterSets(stream)
             val origin = socket.localAddress.hostAddress ?: "0.0.0.0"
             val sdp = RtspSdp.build(origin, random.nextLong() and Long.MAX_VALUE, params?.first, params?.second, host.audioFormat())
             val base = if (request.uri.endsWith("/")) request.uri else "${request.uri}/"
@@ -483,12 +531,13 @@ internal class RtspServer(
             return true
         }
 
-        /** SPS/PPS of the running encoder, waiting for the camera to start if it was idle. */
-        private fun awaitParameterSets(): Pair<ByteArray, ByteArray>? {
+        /** SPS/PPS of [stream]'s running encoder, waiting for the camera to start if it was idle. */
+        private fun awaitParameterSets(stream: RtspStream): Pair<ByteArray, ByteArray>? {
+            val source = videoSources.getValue(stream)
             val deadline = System.nanoTime() + PARAMETER_SET_WAIT_MS * 1_000_000
             while (!closed.get()) {
-                val current = parameterSets
-                val last = lastVideoFrameNs
+                val current = source.parameterSets
+                val last = source.lastFrameNs
                 if (current != null && last != null && System.nanoTime() - last < PARAMETER_SET_FRESH_NS) return current
                 if (System.nanoTime() >= deadline) {
                     // Players fall back to the SPS/PPS repeated in front of every keyframe.
@@ -529,7 +578,8 @@ internal class RtspServer(
                     host.log("RTSP session limit reached, refusing $clientIp")
                     return true
                 }
-                current = Session(randomHex(8).uppercase(Locale.US), this)
+                stream = RtspStream.of(request.uri)
+                current = Session(randomHex(8).uppercase(Locale.US), this, stream)
                 session = current
             }
             if (current.playing) {
@@ -562,7 +612,7 @@ internal class RtspServer(
             respond(cseq, "200 OK", listOf("Session" to current.id, "Range" to "npt=0.000-", "RTP-Info" to current.rtpInfo()))
             // Only after the response: RTP must not reach a TCP client ahead of the PLAY reply.
             current.startPlaying()
-            if (current.video != null) host.requestKeyFrame() else releaseVideo()
+            if (current.video != null) host.requestKeyFrame(current.stream) else releaseVideo()
             updateAudioDemand()
             host.log("RTSP client $clientIp playing (${current.summary()})")
             return true
@@ -696,7 +746,7 @@ internal class RtspServer(
     }
 
     /** One client session: its tracks, a bounded send queue and the thread draining it. */
-    private inner class Session(val id: String, private val connection: Connection) {
+    private inner class Session(val id: String, private val connection: Connection, val stream: RtspStream) {
         @Volatile var video: Track? = null
             private set
         @Volatile var audio: Track? = null
@@ -766,6 +816,11 @@ internal class RtspServer(
         fun pause() {
             playing = false
             queue.clear()
+        }
+
+        /** Skip video until the next keyframe (the stream's source encoder is changing). */
+        fun waitForKeyFrame() {
+            videoWaitingKey = true
         }
 
         fun stop() {

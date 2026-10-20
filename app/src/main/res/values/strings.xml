@@ -10,5 +10,27 @@
         <item>1.2</item>
         <item>disabled</item>
     </string-array>
+    <string-array name="rtsp_sub_size_entries">
+        <item>Low (360p, about 1.4 Mbps)</item>
+        <item>Medium (480p, about 2.5 Mbps)</item>
+        <item>High (720p, about 5.5 Mbps)</item>
+    </string-array>
+    <string-array name="rtsp_sub_size_values">
+        <item>360</item>
+        <item>480</item>
+        <item>720</item>
+    </string-array>
+    <string-array name="rtsp_sub_fps_entries">
+        <item>10 fps</item>
+        <item>15 fps</item>
+        <item>20 fps</item>
+        <item>30 fps</item>
+    </string-array>
+    <string-array name="rtsp_sub_fps_values">
+        <item>10</item>
+        <item>15</item>
+        <item>20</item>
+        <item>30</item>
+    </string-array>
     <string name="streaming_active">🔴 Streaming active</string>
 </resources>

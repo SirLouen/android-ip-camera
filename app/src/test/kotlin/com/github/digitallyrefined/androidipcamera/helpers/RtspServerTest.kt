@@ -137,6 +137,60 @@ class RtspServerTest {
     }
 
     @Test
+    fun `sub stream viewers get only the sub stream's frames`() {
+        val subSps = byteArrayOf(0x67, 0x42, 0xe0.toByte(), 0x1e, 0x0b)
+        val subKeyFrame = annexB(subSps, pps, ByteArray(300) { (it * 7 + 1).toByte() }.also { it[0] = 0x65 })
+        server.onVideoFrame(keyFrame, true, nowUs(), RtspStream.MAIN)
+        server.onVideoFrame(subKeyFrame, true, nowUs(), RtspStream.SUB)
+        client().use { main ->
+            client().use { sub ->
+                val describe = sub.authenticated("DESCRIBE", "${sub.url}/sub")
+                assertEquals(200, describe.status)
+                assertEquals("${sub.url}/sub/", describe.headers["content-base"])
+                assertTrue(String(describe.body).contains("sprop-parameter-sets=" + RtspBase64.encode(subSps)))
+                assertTrue(server.hasSubVideoClients())
+
+                val subSession = sub.authenticated("SETUP", "${sub.url}/sub/trackID=0",
+                    "Transport" to "RTP/AVP/TCP;unicast;interleaved=0-1").headers["session"]!!.substringBefore(';')
+                assertEquals(200, sub.authenticated("PLAY", "${sub.url}/sub/", "Session" to subSession).status)
+                main.authenticated("DESCRIBE", main.url)
+                val mainSession = main.authenticated("SETUP", "${main.url}/trackID=0",
+                    "Transport" to "RTP/AVP/TCP;unicast;interleaved=0-1").headers["session"]!!.substringBefore(';')
+                assertEquals(200, main.authenticated("PLAY", "${main.url}/", "Session" to mainSession).status)
+
+                feeding = true
+                feeder = Thread {
+                    while (feeding) {
+                        server.onVideoFrame(keyFrame, true, nowUs(), RtspStream.MAIN)
+                        server.onVideoFrame(subKeyFrame, true, nowUs(), RtspStream.SUB)
+                        Thread.sleep(20)
+                    }
+                }.apply { start() }
+
+                fun spsSeen(c: TestClient) = (1..20).map { c.readInterleaved() }
+                    .filter { it.first == 0 && (it.second[12].toInt() and 0x1f) == 7 }
+                    .map { it.second.copyOfRange(12, it.second.size).toList() }
+                    .toSet()
+                assertEquals(setOf(subSps.toList()), spsSeen(sub))
+                assertEquals(setOf(sps.toList()), spsSeen(main))
+                stopFeeding()
+            }
+        }
+        waitFor { !server.hasVideoClients() }
+    }
+
+    @Test
+    fun `stream is chosen by the url path`() {
+        assertEquals(RtspStream.MAIN, RtspStream.of("rtsp://cam:8554/live"))
+        assertEquals(RtspStream.MAIN, RtspStream.of("rtsp://cam:8554/live/trackID=0"))
+        assertEquals(RtspStream.MAIN, RtspStream.of("rtsp://cam:8554/"))
+        assertEquals(RtspStream.SUB, RtspStream.of("rtsp://cam:8554/live/sub"))
+        assertEquals(RtspStream.SUB, RtspStream.of("rtsp://cam:8554/live/sub/"))
+        assertEquals(RtspStream.SUB, RtspStream.of("rtsp://cam:8554/live/sub/trackID=1"))
+        assertEquals(RtspStream.SUB, RtspStream.of("rtsp://cam:8554/live/sub?x=1"))
+    }
+
+    @Test
     fun `plays over udp`() {
         server.onVideoFrame(keyFrame, true, nowUs())
         DatagramSocket(0).use { rtp ->
@@ -264,7 +318,7 @@ class RtspServerTest {
         }
         override fun onClientConnected() { connected.incrementAndGet() }
         override fun onClientDisconnected() { disconnected.incrementAndGet() }
-        override fun requestKeyFrame() {}
+        override fun requestKeyFrame(stream: RtspStream) {}
         override fun log(message: String) {}
     }
 

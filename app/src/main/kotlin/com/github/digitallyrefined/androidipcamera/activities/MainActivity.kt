@@ -211,7 +211,8 @@ class MainActivity : AppCompatActivity() {
         val port = prefs.getString("server_port", "4444")?.toIntOrNull() ?: 4444
         val rtspUrl = if (prefs.getBoolean(RtspServer.PREF_ENABLED, false)) {
             val rtspPort = prefs.getString(RtspServer.PREF_PORT, null)?.toIntOrNull() ?: RtspServer.DEFAULT_PORT
-            "\nrtsp://$ipAddress:$rtspPort${RtspServer.PATH}"
+            "\nrtsp://$ipAddress:$rtspPort${RtspServer.PATH}" +
+                "\nrtsp://$ipAddress:$rtspPort${RtspServer.SUB_PATH} (sub)"
         } else {
             ""
         }

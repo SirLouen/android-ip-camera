@@ -26,7 +26,7 @@ alt="Get it on F-Droid" align="center" height="70" /></a>
 ## Features
 
 * 🌎 Built in server, just open the video stream in a web browser, video app or even set it as a camera for [Frigate](https://github.com/blakeblackshear/frigate) or a Home Assistant MJPEG IP Camera (using `https://[ip_address]:4444/video/mjpeg`)
-* 📡 Optional RTSP server (H.264 video + AAC audio) for VLC, Frigate/go2rtc, NVRs and other RTSP clients (using `rtsp://[ip_address]:8554/live`)
+* 📡 Optional RTSP server (H.264 video + AAC audio) for VLC, Frigate/go2rtc, NVRs and other RTSP clients (using `rtsp://[ip_address]:8554/live`, plus a lighter sub stream at `/live/sub` for slow connections)
 * 📴 Option to turn the display off while streaming
 * 🤳 Switch between the main or selfie camera
 * 🎛️ Remote web interface with controls for camera section, image rotation, video recording, audio/video sync, flash light toggle, resolution, zoom, exposure and contrast
@@ -62,6 +62,7 @@ rtsp://[username]:[password]@[ip_address]:8554/live
 ```
 
 * **Video:** the same hardware H.264 stream as `/video/h264` (resolution, frame rate, rotation and mirror follow the web controls). Each client starts at a keyframe.
+* **Sub stream:** `rtsp://[username]:[password]@[ip_address]:8554/live/sub` is a smaller version of the same picture for slow links such as 4G, and can be watched alongside the main stream. Choose its size (360p, 480p or 720p) and frame rate under **Settings > RTSP Stream**; changes apply the next time a viewer connects. The phone encodes it in addition to the main stream only while someone watches it. Where the picture does not go through the GPU path (front camera, devices whose camera is not FULL level), the sub stream carries the main stream instead.
 * **Audio:** the microphone as AAC-LC (44.1 kHz mono), honouring the `audio_gain` control. Can be turned off with **Include Audio**, and is left out when the microphone permission is not granted.
 * **Transport:** RTP over UDP or interleaved in the RTSP TCP connection (`-rtsp_transport tcp`), whichever the client asks for. Audio and video carry RTCP sender reports, so players keep them in sync.
 * **Authentication:** the same username and password as the web server, using RTSP Digest authentication (Basic is accepted when a client sends it up front). Repeated wrong passwords block the address for 15 minutes, like the web server.
@@ -87,6 +88,8 @@ go2rtc:
   streams:
     android-cam:
       - "rtsp://[username]:[password]@[ip_address]:8554/live"
+    android-cam-sub:
+      - "rtsp://[username]:[password]@[ip_address]:8554/live/sub"
 
 cameras:
   android-cam:
@@ -96,9 +99,13 @@ cameras:
         - path: rtsp://127.0.0.1:8554/android-cam
           input_args: preset-rtsp-restream
           roles:
-            - detect
             - record
             - audio
+        # Detect on the lighter sub stream (or drop this input and add `detect` above)
+        - path: rtsp://127.0.0.1:8554/android-cam-sub
+          input_args: preset-rtsp-restream
+          roles:
+            - detect
 ```
 
 ### Using the HTTPS streams

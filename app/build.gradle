@@ -23,8 +23,8 @@ android {
         // Fork versioning, independent of upstream DigitallyRefined/android-ip-camera:
         // versionName is this fork's own semver (tagged v<versionName>), versionCode a counter
         // increased by one for every release.
-        versionCode 3
-        versionName "0.1.2"
+        versionCode 4
+        versionName "0.2.0"
 
         // https://f-droid.org/docs/Reproducible_Builds/#pngs-generated-from-vector-drawables
         vectorDrawables.generatedDensities = []
