@@ -885,9 +885,11 @@ class StreamingService : LifecycleService() {
         val prefs = PreferenceManager.getDefaultSharedPreferences(this)
         val shortSide = prefs.getString(RtspServer.PREF_SUB_SIZE, null)?.toIntOrNull() ?: RtspServer.DEFAULT_SUB_SIZE
         val fps = (prefs.getString(RtspServer.PREF_SUB_FPS, null)?.toIntOrNull() ?: RtspServer.DEFAULT_SUB_FPS).coerceIn(1, 60)
+        val kbps = prefs.getString(RtspServer.PREF_SUB_BITRATE, null)?.toIntOrNull() ?: RtspServer.DEFAULT_SUB_BITRATE_KBPS
+        val bitrate = H264HardwareEncoder.clampBitrate(kbps * 1000L)
         val (w, h) = CameraGlPipe.scaledFrame(pipe.width, pipe.height, shortSide)
         val enc = try {
-            H264HardwareEncoder(w, h, fps, H264HardwareEncoder.bitrateFor(w, h), true) { d, k, pts ->
+            H264HardwareEncoder(w, h, fps, bitrate, true, RtspServer.SUB_KEYFRAME_INTERVAL_SEC) { d, k, pts ->
                 rtsp.onVideoFrame(d, k, pts, RtspStream.SUB)
             }
         } catch (e: Exception) {
@@ -904,7 +906,7 @@ class StreamingService : LifecycleService() {
             return
         }
         enc.requestKeyFrame()
-        Log.i(TAG, "RTSP sub stream ${w}x$h @${fps}fps")
+        Log.i(TAG, "RTSP sub stream ${w}x$h @${fps}fps ${bitrate / 1000}kbps")
     }
 
     private fun stopSubStream() {

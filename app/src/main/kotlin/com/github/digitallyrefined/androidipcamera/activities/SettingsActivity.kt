@@ -188,6 +188,10 @@ class SettingsActivity : AppCompatActivity() {
                 }
             findPreference<androidx.preference.ListPreference>(RtspServer.PREF_SUB_FPS)?.summaryProvider =
                 androidx.preference.ListPreference.SimpleSummaryProvider.getInstance()
+            findPreference<androidx.preference.ListPreference>(RtspServer.PREF_SUB_BITRATE)?.summaryProvider =
+                Preference.SummaryProvider<androidx.preference.ListPreference> {
+                    "${it.entry} video. Keep it to about half the viewer's connection speed so dips don't stall it"
+                }
 
             // Optional RTSP server: shares the camera, encoder and credentials with the HTTP server
             findPreference<androidx.preference.CheckBoxPreference>(RtspServer.PREF_ENABLED)?.apply {
@@ -424,7 +428,8 @@ class SettingsActivity : AppCompatActivity() {
         }
 
         private fun setRtspOptionsVisible(visible: Boolean) {
-            listOf(RtspServer.PREF_PORT, RtspServer.PREF_AUDIO, RtspServer.PREF_SUB_SIZE, RtspServer.PREF_SUB_FPS)
+            listOf(RtspServer.PREF_PORT, RtspServer.PREF_AUDIO, RtspServer.PREF_SUB_SIZE, RtspServer.PREF_SUB_FPS,
+                RtspServer.PREF_SUB_BITRATE)
                 .forEach { findPreference<Preference>(it)?.isVisible = visible }
         }
 

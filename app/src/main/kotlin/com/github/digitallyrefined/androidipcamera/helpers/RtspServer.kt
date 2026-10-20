@@ -82,11 +82,15 @@ internal class RtspServer(
         const val PREF_ENABLED = "rtsp_enabled"
         const val PREF_PORT = "rtsp_port"
         const val PREF_AUDIO = "rtsp_audio"
-        /** Sub stream: height of the short side in pixels, and frame rate. */
+        /** Sub stream: height of the short side in pixels, frame rate and video bitrate (kbps). */
         const val PREF_SUB_SIZE = "rtsp_sub_size"
         const val PREF_SUB_FPS = "rtsp_sub_fps"
+        const val PREF_SUB_BITRATE = "rtsp_sub_bitrate"
         const val DEFAULT_SUB_SIZE = 360
         const val DEFAULT_SUB_FPS = 15
+        const val DEFAULT_SUB_BITRATE_KBPS = 500
+        /** Keyframes are the largest frames: the sub stream sends one every 2 s instead of every 1 s. */
+        const val SUB_KEYFRAME_INTERVAL_SEC = 2
 
         private const val SERVER_NAME = "Android IP Camera"
         private const val CNAME = "android-ip-camera"
