@@ -67,6 +67,12 @@
             android:defaultValue="15"
             android:entries="@array/rtsp_sub_fps_entries"
             android:entryValues="@array/rtsp_sub_fps_values" />
+        <ListPreference
+            android:key="rtsp_sub_bitrate"
+            android:title="Sub Stream Bitrate"
+            android:defaultValue="500"
+            android:entries="@array/rtsp_sub_bitrate_entries"
+            android:entryValues="@array/rtsp_sub_bitrate_values" />
     </PreferenceCategory>
 
     <PreferenceCategory android:title="Recording">

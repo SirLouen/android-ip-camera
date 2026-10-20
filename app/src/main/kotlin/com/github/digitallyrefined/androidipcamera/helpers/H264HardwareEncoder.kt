@@ -27,6 +27,8 @@ class H264HardwareEncoder(
     frameRate: Int,
     bitRate: Int,
     val useSurface: Boolean,
+    /** Seconds between keyframes. Longer saves bandwidth; new viewers wait up to this long. */
+    keyFrameIntervalSec: Int = 1,
     private val onNal: (ByteArray, Boolean, Long) -> Unit
 ) {
     private val codec: MediaCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
@@ -61,7 +63,7 @@ class H264HardwareEncoder(
             setInteger(MediaFormat.KEY_COLOR_FORMAT, colorFormat)
             setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
             setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, keyFrameIntervalSec)
             try { setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR) } catch (_: Exception) {}
         }
         try {
@@ -701,9 +703,12 @@ class H264HardwareEncoder(
          * Target ~0.2 bits/pixel/frame at 30fps (w*h*6) — enough to avoid visible H.264 macroblocking
          * (the old w*h*3 ≈ 0.1 bpp looked "compressed" at 1440x1080). Clamped to the device's range.
          */
-        fun bitrateFor(w: Int, h: Int): Int {
+        fun bitrateFor(w: Int, h: Int): Int = clampBitrate(w.toLong() * h * 6)
+
+        /** [bitsPerSecond] within the device encoder's supported range. */
+        fun clampBitrate(bitsPerSecond: Long): Int {
             val c = caps()
-            return (w.toLong() * h * 6).coerceIn(c.minBitrate.toLong(), c.maxBitrate.toLong()).toInt()
+            return bitsPerSecond.coerceIn(c.minBitrate.toLong(), c.maxBitrate.toLong()).toInt()
         }
     }
 }
