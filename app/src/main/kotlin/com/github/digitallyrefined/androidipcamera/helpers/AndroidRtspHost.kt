@@ -13,7 +13,7 @@ internal class AndroidRtspHost(
     private val onLog: (String) -> Unit,
     private val clientConnected: () -> Unit,
     private val clientDisconnected: () -> Unit,
-    private val keyFrameRequest: () -> Unit,
+    private val keyFrameRequest: (RtspStream) -> Unit,
     private val streamingEnabled: () -> Boolean
 ) : RtspServer.Host {
     private val prefs get() = PreferenceManager.getDefaultSharedPreferences(context)
@@ -45,7 +45,7 @@ internal class AndroidRtspHost(
 
     override fun onClientDisconnected() = clientDisconnected()
 
-    override fun requestKeyFrame() = keyFrameRequest()
+    override fun requestKeyFrame(stream: RtspStream) = keyFrameRequest(stream)
 
     override fun log(message: String) = onLog(message)
 

@@ -29,6 +29,11 @@ class H264StreamingEncoder(
         private set
     /** RTSP server sharing this encoder's output, when RTSP is enabled. */
     @Volatile internal var rtspServer: RtspServer? = null
+    /**
+     * True while a separate, smaller encoder feeds the RTSP sub stream. Otherwise (no sub encoder
+     * running, or none possible on this capture path) sub stream viewers get this encoder's frames.
+     */
+    @Volatile internal var subStreamEncoded = false
     private val releasingEncoders = java.util.concurrent.CopyOnWriteArrayList<H264HardwareEncoder>()
     private var glPipe: CameraGlPipe? = null
     private var backend: CaptureBackend? = null
@@ -170,7 +175,10 @@ class H264StreamingEncoder(
      */
     fun broadcastH264(data: ByteArray, isKey: Boolean, ptsUs: Long) {
         // RTSP sessions queue frames on their own sender threads, so this never blocks the codec.
-        rtspServer?.onVideoFrame(data, isKey, ptsUs)
+        rtspServer?.let { rtsp ->
+            rtsp.onVideoFrame(data, isKey, ptsUs, RtspStream.MAIN)
+            if (!subStreamEncoded) rtsp.onVideoFrame(data, isKey, ptsUs, RtspStream.SUB)
+        }
         val helper = streamingServerHelper ?: return
         val clients = helper.getH264Clients()
         if (clients.isEmpty()) return

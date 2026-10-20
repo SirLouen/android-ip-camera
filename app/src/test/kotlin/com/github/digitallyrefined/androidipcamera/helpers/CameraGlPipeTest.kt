@@ -19,6 +19,16 @@ class CameraGlPipeTest {
     }
 
     @Test
+    fun `sub stream frame keeps the main frame's shape`() {
+        assertEquals(360 to 640, CameraGlPipe.scaledFrame(1080, 1920, 360))
+        assertEquals(640 to 360, CameraGlPipe.scaledFrame(1920, 1080, 360))
+        assertEquals(854 to 480, CameraGlPipe.scaledFrame(1920, 1080, 480))
+        assertEquals(480 to 360, CameraGlPipe.scaledFrame(800, 600, 360))
+        assertEquals(1280 to 720, CameraGlPipe.scaledFrame(1280, 720, 720)) // never scaled up
+        assertEquals(800 to 600, CameraGlPipe.scaledFrame(800, 600, 720))
+    }
+
+    @Test
     fun `sensors already upright keep the camera shape`() {
         assertEquals(1280 to 720, CameraGlPipe.frameSize(1280, 720, sensorOrientation = 0, rotation = 0))
         assertEquals(800 to 600, CameraGlPipe.frameSize(800, 600, sensorOrientation = 180, rotation = 360))

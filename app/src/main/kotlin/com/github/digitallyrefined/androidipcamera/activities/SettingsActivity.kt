@@ -181,10 +181,17 @@ class SettingsActivity : AppCompatActivity() {
                 }
             }
 
+            // Sub stream (/live/sub): applied the next time a viewer connects to it
+            findPreference<androidx.preference.ListPreference>(RtspServer.PREF_SUB_SIZE)?.summaryProvider =
+                Preference.SummaryProvider<androidx.preference.ListPreference> {
+                    "${it.entry}. Smaller stream at rtsp://[ip_address]:[port]${RtspServer.SUB_PATH} for slow connections such as 4G"
+                }
+            findPreference<androidx.preference.ListPreference>(RtspServer.PREF_SUB_FPS)?.summaryProvider =
+                androidx.preference.ListPreference.SimpleSummaryProvider.getInstance()
+
             // Optional RTSP server: shares the camera, encoder and credentials with the HTTP server
             findPreference<androidx.preference.CheckBoxPreference>(RtspServer.PREF_ENABLED)?.apply {
-                findPreference<EditTextPreference>(RtspServer.PREF_PORT)?.isVisible = isChecked
-                findPreference<androidx.preference.CheckBoxPreference>(RtspServer.PREF_AUDIO)?.isVisible = isChecked
+                setRtspOptionsVisible(isChecked)
 
                 setOnPreferenceChangeListener { _, newValue ->
                     val enabled = newValue as Boolean
@@ -194,8 +201,7 @@ class SettingsActivity : AppCompatActivity() {
                             Toast.LENGTH_LONG).show()
                         return@setOnPreferenceChangeListener false
                     }
-                    findPreference<EditTextPreference>(RtspServer.PREF_PORT)?.isVisible = enabled
-                    findPreference<androidx.preference.CheckBoxPreference>(RtspServer.PREF_AUDIO)?.isVisible = enabled
+                    setRtspOptionsVisible(enabled)
                     restartStreamingServer()
                     true
                 }
@@ -415,6 +421,11 @@ class SettingsActivity : AppCompatActivity() {
                 ?: return "Default: ${RecordingsHelper.DEFAULT_RELATIVE_PATH}"
             val name = DocumentFile.fromTreeUri(requireContext(), uri)?.name
             return "Custom folder: ${name ?: uri}"
+        }
+
+        private fun setRtspOptionsVisible(visible: Boolean) {
+            listOf(RtspServer.PREF_PORT, RtspServer.PREF_AUDIO, RtspServer.PREF_SUB_SIZE, RtspServer.PREF_SUB_FPS)
+                .forEach { findPreference<Preference>(it)?.isVisible = visible }
         }
 
         private fun configuredHttpPort(): Int =
