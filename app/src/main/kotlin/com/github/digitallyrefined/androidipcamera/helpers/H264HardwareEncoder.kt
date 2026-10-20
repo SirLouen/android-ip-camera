@@ -64,9 +64,16 @@ class H264HardwareEncoder(
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
             try { setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR) } catch (_: Exception) {}
         }
-        codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-        if (useSurface) inputSurface = codec.createInputSurface()
-        codec.start()
+        try {
+            codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            if (useSurface) inputSurface = codec.createInputSurface()
+            codec.start()
+        } catch (e: Exception) {
+            // e.g. a size this encoder does not support: free the codec so the caller can retry.
+            try { inputSurface?.release() } catch (_: Exception) {}
+            try { codec.release() } catch (_: Exception) {}
+            throw e
+        }
         thread = Thread { drainLoop() }.apply { isDaemon = true; start() }
         Log.i(TAG, "H264HardwareEncoder started ${width}x$height @${frameRate}fps ${bitRate / 1000}kbps surface=$useSurface")
     }

@@ -249,17 +249,44 @@ class CameraGlPipe(
         frameRateLimiter.reset()
     }
 
+    /**
+     * Sizes the camera's buffers to the resolution CameraX negotiated for this surface, so the
+     * camera renders at the selected stream size rather than the placeholder from
+     * [standardBufferSize]. Call before handing [inputSurface] to CameraX.
+     */
+    fun setCameraBufferSize(w: Int, h: Int) {
+        surfaceTexture.setDefaultBufferSize(w, h)
+        frameWidth = w
+        frameHeight = h
+    }
+
     /** Returns a standard camera-compatible buffer size matching the output aspect ratio. */
     private fun standardBufferSize(): Pair<Int, Int> {
-        val aspect = width.toFloat() / height.toFloat()
+        // Camera buffers are landscape even when the encoded frame is portrait.
+        val long = maxOf(width, height)
+        val aspect = long.toFloat() / minOf(width, height).toFloat()
         return if (aspect >= 1.5f) { // 16:9-ish
             // 1280x720 is widely supported by modern cameras; if the requested size is smaller
             // than that, use 640x360 (same 16:9 ratio, less likely to be rejected by the HAL).
-            if (width >= 1280) 1280 to 720 else 640 to 360
+            if (long >= 1280) 1280 to 720 else 640 to 360
         } else { // 4:3-ish
-            if (width >= 640) 640 to 480 else 320 to 240
+            if (long >= 640) 640 to 480 else 320 to 240
         }
     }
 
-    companion object { private const val TAG = "CameraGlPipe" }
+    companion object {
+        private const val TAG = "CameraGlPipe"
+
+        /**
+         * Shape of the picture this pipe draws for a camera output of [cameraWidth]×[cameraHeight].
+         * SurfaceTexture frames arrive turned by the sensor orientation (portrait on most phones)
+         * and [rotation] turns them further, so an odd number of quarter turns swaps the sides.
+         * Sizing the encoder to this keeps a portrait picture from being pillarboxed into a
+         * landscape frame.
+         */
+        fun frameSize(cameraWidth: Int, cameraHeight: Int, sensorOrientation: Int, rotation: Int): Pair<Int, Int> {
+            val quarterTurns = (((sensorOrientation + rotation) % 360 + 360) % 360 + 45) / 90
+            return if (quarterTurns % 2 == 1) cameraHeight to cameraWidth else cameraWidth to cameraHeight
+        }
+    }
 }
