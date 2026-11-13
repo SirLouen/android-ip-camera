@@ -17,7 +17,6 @@ import android.os.Looper
 import android.util.Base64
 import android.widget.Toast
 import androidx.core.content.ContextCompat
-import androidx.core.net.toUri
 import androidx.preference.PreferenceManager
 import com.github.digitallyrefined.androidipcamera.helpers.SecureStorage
 import kotlinx.coroutines.CoroutineScope
@@ -33,15 +32,13 @@ import java.io.IOException
 import java.io.InputStreamReader
 import java.io.OutputStream
 import java.io.PrintWriter
-import java.net.InetAddress
+import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.security.KeyStore
-import java.security.SecureRandom
 import java.util.Locale
 import kotlin.math.ceil
 import kotlin.math.floor
@@ -49,9 +46,6 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import org.json.JSONArray
 import org.json.JSONObject
-import javax.net.ssl.KeyManagerFactory
-import javax.net.ssl.SSLContext
-import javax.net.ssl.SSLServerSocket
 
 class StreamingServerHelper(
     private val context: Context,
@@ -222,6 +216,39 @@ class StreamingServerHelper(
         closeClientConnection()
     }
 
+    /**
+     * Binds the HTTP(S) listener, retrying while the port is still in TIME_WAIT. TLS sockets come
+     * from the shared [TlsServerConfig] so the web, RTSP and ONVIF endpoints use one certificate.
+     */
+    private fun bindServerSocket(port: Int, tls: TlsServerConfig?): ServerSocket {
+        val bindAddress = ListenInterface.resolve(context)
+        if (!ListenInterface.isAssigned(bindAddress)) {
+            throw IOException(ListenInterface.unavailableMessage(ListenInterface.value(context)))
+        }
+        var lastError: IOException? = null
+        for (attempt in 0..SOCKET_BIND_MAX_RETRIES) {
+            try {
+                return tls?.createServerSocket(port, 50, bindAddress, soTimeout = 30_000) ?: ServerSocket().apply {
+                    reuseAddress = true
+                    soTimeout = 30_000
+                    bind(InetSocketAddress(bindAddress, port), 50)
+                }
+            } catch (e: IOException) {
+                lastError = e
+                val msg = e.message ?: ""
+                val isBindError = msg.contains("Address already in use") ||
+                    msg.contains("BindException") ||
+                    msg.contains("errno = 48") ||
+                    msg.contains("EADDRINUSE")
+                if (!isBindError || attempt == SOCKET_BIND_MAX_RETRIES) throw e
+                val delay = SOCKET_BIND_RETRY_DELAY_MS * (1L shl attempt)
+                onLog("Port $port in use, retrying in ${delay}ms (attempt ${attempt + 1}/$SOCKET_BIND_MAX_RETRIES)")
+                Thread.sleep(delay)
+            }
+        }
+        throw lastError ?: IOException("Failed to create server socket after retries")
+    }
+
     private fun isRateLimited(clientIp: String): Boolean {
         val now = System.currentTimeMillis()
         val attempt = failedAttempts.getOrPut(clientIp) { FailedAttempt() }
@@ -322,212 +349,34 @@ class StreamingServerHelper(
               try {
                   val prefs = PreferenceManager.getDefaultSharedPreferences(context)
                   val port = prefs.getString("server_port", null)?.toIntOrNull()?.takeIf { it in 1..65535 } ?: streamPort
-                  val secureStorage = SecureStorage(context)
-                  val certificatePath = prefs.getString("certificate_path", null)
 
-                  var rawPassword = secureStorage.getSecureString(SecureStorage.KEY_CERT_PASSWORD, null)
-                  if (certificatePath == null && rawPassword.isNullOrEmpty()) {
-                      rawPassword = generateCertificatePassword()
-                      if (!secureStorage.putSecureString(SecureStorage.KEY_CERT_PASSWORD, rawPassword)) {
-                          onLog("Unable to store the generated certificate password")
-                          return@launch
+                  // The same TLS material is shared with RTSP and ONVIF (see TlsHelper).
+                  val tlsConfig = try {
+                      TlsHelper.serverConfig(context) { onLog(it) }
+                  } catch (e: Exception) {
+                      Handler(Looper.getMainLooper()).post {
+                          onLog("Certificate loading failed: ${e.message}")
+                          val errorMsg = when {
+                              e.message?.contains("password") == true ->
+                                  "Certificate password is incorrect, check Settings > Advanced Security"
+                              e.message?.contains("keystore") == true ->
+                                  "Certificate file is corrupted or invalid, regenerate with setup.bat"
+                              else ->
+                                  "Certificate error: ${e.message}"
+                          }
+                          Toast.makeText(context, errorMsg, Toast.LENGTH_LONG).show()
                       }
-                  }
-                  val certificatePassword = rawPassword?.let {
-                      if (it.isEmpty()) null else it.toCharArray()
-                  }
-
-                  // Certificate setup required - no defaults
-                  var finalCertificatePath = certificatePath
-                  var finalCertificatePassword = certificatePassword
-
-                  if (certificatePath == null) {
-                      // Use personal certificate from assets - requires password configuration
-                      try {
-                          val personalCertFile = File(context.filesDir, "personal_certificate.p12")
-                          if (!personalCertFile.exists()) {
-                              // Preserve compatibility with packaged certificates, then generate a
-                              // device-local one when the upstream source tree has no certificate asset.
-                              try {
-                                  context.assets.open("personal_certificate.p12").use { input ->
-                                      personalCertFile.outputStream().use { output ->
-                                          input.copyTo(output)
-                                      }
-                                  }
-                              } catch (assetException: Exception) {
-                                  val password = rawPassword
-                                  if (password.isNullOrEmpty() ||
-                                      CertificateHelper.generateCertificate(context, password) == null) {
-                                      Handler(Looper.getMainLooper()).post {
-                                          onLog("Certificate generation failed")
-                                          Toast.makeText(context,
-                                              "Unable to generate TLS certificate",
-                                              Toast.LENGTH_LONG).show()
-                                      }
-                                      return@launch
-                                  }
-                              }
-                          }
-                          finalCertificatePath = personalCertFile.absolutePath
-
-                          // Require certificate password to be configured
-                          if (finalCertificatePassword == null) {
-                              return@launch
-                          }
-
-                      } catch (e: Exception) {
-                          Handler(Looper.getMainLooper()).post {
-                              onLog("ERROR: Could not load certificate: ${e.message}")
-                              Toast.makeText(context, "Certificate error, check certificate file and password in Settings", Toast.LENGTH_LONG).show()
-                          }
-                          return@launch
-                      }
+                      return@launch
                   }
 
-                  val bindAddress = InetAddress.getByName("0.0.0.0")
-
-                  // Get TLS version preference
-                  val tlsVersionPref = prefs.getString("tls_version", "1.3") ?: "1.3"
-                  val useTLS = tlsVersionPref != "disabled"
-
-                  val createdServerSocket = if (useTLS) {
-                      try {
-                          // Determine which certificate file to use
-                          val certFile = if (certificatePath != null) {
-                              // Custom certificate - copy from URI to local file
-                              val uri = certificatePath.toUri()
-                              val privateFile = File(context.filesDir, "certificate.p12")
-                              if (privateFile.exists()) privateFile.delete()
-                              context.contentResolver.openInputStream(uri)?.use { input ->
-                                  privateFile.outputStream().use { output ->
-                                      input.copyTo(output)
-                                  }
-                              } ?: throw IOException("Failed to open certificate file")
-                              privateFile
-                          } else {
-                              // Personal certificate
-                              File(finalCertificatePath!!)
-                          }
-
-                          // Android 10 introduced the platform TLS 1.3 implementation. Older
-                          // Android versions use their platform TLS 1.2 provider instead.
-                          val tlsVersionsToTry = when {
-                              tlsVersionPref == "1.2" -> listOf("TLSv1.2")
-                              android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q ->
-                                  listOf("TLSv1.3")
-                              else -> listOf("TLSv1.2")
-                          }
-
-                          var sslServerSocket: SSLServerSocket? = null
-                          var lastError: Exception? = null
-
-                          for (tlsVersion in tlsVersionsToTry) {
-                              try {
-                                  certFile.inputStream().use { inputStream ->
-                                      val keyStore = KeyStore.getInstance("PKCS12")
-                                      keyStore.load(inputStream, finalCertificatePassword)
-                                      val keyManagerFactory = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm())
-                                      keyManagerFactory.init(keyStore, finalCertificatePassword)
-
-                                      val sslContext = try {
-                                          SSLContext.getInstance(tlsVersion)
-                                      } catch (e: Exception) {
-                                          // The selected TLS version is unavailable.
-                                          lastError = e
-                                          continue
-                                      }
-
-                                      sslContext.init(keyManagerFactory.keyManagers, null, null)
-                                      val sslServerSocketFactory = sslContext.serverSocketFactory
-                                      for (bindAttempt in 0..SOCKET_BIND_MAX_RETRIES) {
-                                          try {
-                                              sslServerSocket = (sslServerSocketFactory.createServerSocket(port, 50, bindAddress) as SSLServerSocket).apply {
-                                                  reuseAddress = true
-                                                  enabledProtocols = arrayOf(tlsVersion)
-                                                  // Don't restrict cipher suites - let the system negotiate
-                                                  soTimeout = 30000
-                                              }
-                                              onLog("Server started with TLS $tlsVersion")
-                                              break
-                                          } catch (bindEx: IOException) {
-                                              val msg = bindEx.message ?: ""
-                                              val isBindError = msg.contains("Address already in use") ||
-                                                  msg.contains("BindException") ||
-                                                  msg.contains("errno = 48") ||
-                                                  msg.contains("EADDRINUSE")
-                                              val isCertError = msg.contains("certificate") ||
-                                                  msg.contains("keystore") ||
-                                                  msg.contains("password")
-                                              if (isBindError && !isCertError && bindAttempt < SOCKET_BIND_MAX_RETRIES) {
-                                                  val delay = SOCKET_BIND_RETRY_DELAY_MS * (1L shl bindAttempt)
-                                                  onLog("Port $port in use, retrying in ${delay}ms (attempt ${bindAttempt + 1}/$SOCKET_BIND_MAX_RETRIES)")
-                                                  Thread.sleep(delay)
-                                                  continue
-                                              }
-                                              throw bindEx
-                                          }
-                                      }
-                                      break
-                                  }
-                              } catch (keystoreException: Exception) {
-                                  lastError = keystoreException
-                                  continue
-                              }
-                          }
-
-                          val readyServerSocket = sslServerSocket
-                              ?: throw lastError ?: IOException("Failed to create SSL server socket with any TLS version")
-
-                          readyServerSocket
-                      } catch (keystoreException: Exception) {
-                          Handler(Looper.getMainLooper()).post {
-                              onLog("Certificate loading failed: ${keystoreException.message}")
-                              val errorMsg = when {
-                                  keystoreException.message?.contains("password") == true ->
-                                      "Certificate password is incorrect, check Settings > Advanced Security"
-                                  keystoreException.message?.contains("keystore") == true ->
-                                      "Certificate file is corrupted or invalid, regenerate with setup.bat"
-                                  else ->
-                                      "Certificate error: ${keystoreException.message}"
-                              }
-                              Toast.makeText(context, errorMsg, Toast.LENGTH_LONG).show()
-                          }
-                          return@launch
+                  val createdServerSocket = try {
+                      bindServerSocket(port, tlsConfig)
+                  } catch (e: Exception) {
+                      Handler(Looper.getMainLooper()).post {
+                          onLog("CRITICAL: Failed to create server: ${e.message}")
+                          Toast.makeText(context, "Failed to start server: ${e.message}", Toast.LENGTH_LONG).show()
                       }
-                  } else {
-                      // Use HTTP (no TLS)
-                      try {
-                          var httpSocket: ServerSocket? = null
-                          for (bindAttempt in 0..SOCKET_BIND_MAX_RETRIES) {
-                              try {
-                                  httpSocket = ServerSocket(port, 50, bindAddress).apply {
-                                      reuseAddress = true
-                                      soTimeout = 30000
-                                  }
-                                  break
-                              } catch (e: IOException) {
-                                  val msg = e.message ?: ""
-                                  val isBindError = msg.contains("Address already in use") ||
-                                      msg.contains("BindException") ||
-                                      msg.contains("errno = 48") ||
-                                      msg.contains("EADDRINUSE")
-                                  if (isBindError && bindAttempt < SOCKET_BIND_MAX_RETRIES) {
-                                      val delay = SOCKET_BIND_RETRY_DELAY_MS * (1L shl bindAttempt)
-                                      onLog("Port $port in use, retrying in ${delay}ms (attempt ${bindAttempt + 1}/$SOCKET_BIND_MAX_RETRIES)")
-                                      Thread.sleep(delay)
-                                      continue
-                                  }
-                                  throw e
-                              }
-                          }
-                          httpSocket ?: throw IOException("Failed to create server socket after retries")
-                      } catch (e: Exception) {
-                          Handler(Looper.getMainLooper()).post {
-                              onLog("CRITICAL: Failed to create HTTP server: ${e.message}")
-                              Toast.makeText(context, "Failed to start HTTP server: ${e.message}", Toast.LENGTH_LONG).show()
-                          }
-                          return@launch
-                      }
+                      return@launch
                   }
                   localServerSocket = createdServerSocket
                   val published = synchronized(this@StreamingServerHelper) {
@@ -540,7 +389,7 @@ class StreamingServerHelper(
                   if (!published) return@launch
 
                   serverWasPublished = true
-                  onLog("Server started on port $port (${if (useTLS) "HTTPS" else "HTTP"})")
+                  onLog("Server started on port $port (${if (tlsConfig != null) "HTTPS" else "HTTP"})")
                   // Clear the starting flag now that server is running
                   synchronized(this@StreamingServerHelper) {
                       if (generation == serverGeneration) isStarting = false
@@ -880,7 +729,7 @@ class StreamingServerHelper(
             }
 
             // ---- Recorded files endpoints (Movies/AndroidIPCamera or the custom folder) ----
-            if (fileManager.handleRequest(httpMethod, path, writer, outputStream)) {
+            if (fileManager.handleRequest(httpMethod, path, uri, headers, writer, outputStream)) {
                 try { socket.close() } catch (_: Exception) {}
                 return
             }
@@ -1632,9 +1481,19 @@ class StreamingServerHelper(
         val deviceHasFlash: Boolean,
         val audioGain: String,
         val snapshotRes: String,
+        val motionDetectionEnabled: Boolean,
+        val motionSensitivity: String,
+        val motionRecordStopDelay: String,
+        val onvifEnabled: Boolean,
+        val rtspEnabled: Boolean,
+        val rtspAudio: Boolean,
+        val rtspSubSize: String,
+        val rtspSubFps: String,
+        val rtspSubBitrate: String,
     )
 
     private data class DeviceInfo(
+        val context: Context,
         val cameras: List<InfoCamera>,
         val batteryPercent: Int,
         val wifiStrength: Int,
@@ -1695,11 +1554,23 @@ class StreamingServerHelper(
                 put("deviceHasFlash", settings.deviceHasFlash)
                 put("audioGain", settings.audioGain)
                 put("snapshotRes", settings.snapshotRes)
+                put("motionDetectionEnabled", settings.motionDetectionEnabled)
+                put("motionSensitivity", settings.motionSensitivity)
+                put("motionRecordStopDelay", settings.motionRecordStopDelay)
+                // Whether RTSP/ONVIF is enabled. Motion detection is always available in the web UI.
+                put("onvifEnabled", settings.onvifEnabled)
+                put("rtspEnabled", settings.rtspEnabled)
+                put("rtspAudio", settings.rtspAudio)
+                put("rtspSubSize", settings.rtspSubSize)
+                put("rtspSubFps", settings.rtspSubFps)
+                put("rtspSubBitrate", settings.rtspSubBitrate)
             })
+            put("appVersion", context.packageManager.getPackageInfo(context.packageName, 0).versionName.orEmpty())
         }.toString()
     }
 
     private fun buildDeviceInfo(): DeviceInfo {
+        val context = context
         val idle = clients.isEmpty() && h264Clients.isEmpty()
         val cameraList = buildCameraInfoList(idle)
         // Gather per-camera stored settings from SharedPreferences. Keys use suffixes like
@@ -1805,6 +1676,7 @@ class StreamingServerHelper(
         }
 
         return DeviceInfo(
+            context = context,
             cameras = cameraList,
             batteryPercent = getBatteryPercent(),
             wifiStrength = getWifiStrength(),
@@ -1838,6 +1710,20 @@ class StreamingServerHelper(
             deviceHasFlash = anyBackCameraWithFlash(),
             audioGain = prefs.getString("audio_gain", "1.0") ?: "1.0",
             snapshotRes = prefs.getString("snapshot_res_$cameraId", "max") ?: "max",
+            motionDetectionEnabled = prefs.getBoolean(MotionMonitor.PREF_ENABLED, false),
+            motionSensitivity = prefs.getString(MotionMonitor.PREF_SENSITIVITY, MotionMonitor.DEFAULT_SENSITIVITY.toString())
+                ?: MotionMonitor.DEFAULT_SENSITIVITY.toString(),
+            motionRecordStopDelay = prefs.getString(MotionMonitor.PREF_STOP_DELAY, MotionMonitor.DEFAULT_STOP_DELAY.toString())
+                ?: MotionMonitor.DEFAULT_STOP_DELAY.toString(),
+            onvifEnabled = prefs.getBoolean(RtspServer.PREF_ENABLED, false),
+            rtspEnabled = prefs.getBoolean(RtspServer.PREF_ENABLED, false),
+            rtspAudio = prefs.getBoolean(RtspServer.PREF_AUDIO, true),
+            rtspSubSize = prefs.getString(RtspServer.PREF_SUB_SIZE, null)
+                ?: RtspServer.DEFAULT_SUB_SIZE.toString(),
+            rtspSubFps = prefs.getString(RtspServer.PREF_SUB_FPS, null)
+                ?: RtspServer.DEFAULT_SUB_FPS.toString(),
+            rtspSubBitrate = prefs.getString(RtspServer.PREF_SUB_BITRATE, null)
+                ?: RtspServer.DEFAULT_SUB_BITRATE_KBPS.toString(),
         )
     }
 
@@ -1897,6 +1783,20 @@ class StreamingServerHelper(
                     group.mapNotNull { focalLengthsOf(it)?.maxOrNull() }.maxOrNull()
                 }
 
+            // Keep the user's saved stream size in the reported list even when the camera is busy
+            // and does not enumerate it right now (Camera1 preview sizes below are only available
+            // while idle). Without this, /info.json can omit the selected size and the web UI would
+            // treat it as unsupported and fall back to Auto.
+            val prefs = PreferenceManager.getDefaultSharedPreferences(context)
+            val storedCamId = prefs.getString("camera_id", null)
+            val savedStreamSize = Regex("^(\\d+)x(\\d+)$")
+                .find(prefs.getString("stream_res", "auto") ?: "auto")
+                ?.let { m ->
+                    val w = m.groupValues[1].toIntOrNull()
+                    val h = m.groupValues[2].toIntOrNull()
+                    if (w != null && h != null && w > 0 && h > 0) w to h else null
+                }
+
             sources.map { source ->
                 val ch = source.sizesCharacteristics
                 val label = cameraLabel(source)
@@ -1912,6 +1812,14 @@ class StreamingServerHelper(
                         @Suppress("DEPRECATION") c1.parameters.supportedPreviewSizes?.forEach { set.add(it.width to it.height) }
                         @Suppress("DEPRECATION") c1.release()
                     } catch (_: Exception) {}
+                }
+                if (savedStreamSize != null) {
+                    val savedApplies = storedCamId == null ||
+                        storedCamId == source.id ||
+                        storedCamId == source.logicalId ||
+                        storedCamId == source.physicalId ||
+                        storedCamId == source.facing
+                    if (savedApplies) set.add(savedStreamSize)
                 }
                 val sizes = set
                     .filter { it.first <= encCaps.maxW && it.second <= encCaps.maxH }
@@ -2084,14 +1992,6 @@ class StreamingServerHelper(
         bm?.getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY) ?: -1
     } catch (_: Exception) {
         -1
-    }
-
-    private fun generateCertificatePassword(): String {
-        val alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
-        val random = SecureRandom()
-        return buildString(32) {
-            repeat(32) { append(alphabet[random.nextInt(alphabet.length)]) }
-        }
     }
 
     private fun getWifiStrength(): Int = try {
